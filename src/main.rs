@@ -1,0 +1,351 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use eframe::egui;
+use rfd::FileDialog;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::PathBuf;
+
+#[derive(Clone, Debug)]
+struct EnvItem {
+    key: String,
+    value: String,
+    description: String,
+    is_commented_out: bool,
+    is_header: bool,
+    header_text: String,
+}
+
+struct EnvEditorApp {
+    items: Vec<EnvItem>,
+    example_path: Option<PathBuf>,
+    env_path: Option<PathBuf>,
+    status_msg: String,
+    search_query: String,
+}
+
+impl Default for EnvEditorApp {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            example_path: None,
+            env_path: None,
+            status_msg: "Bitte laden Sie eine Template-Datei (z.B. example.env)...".to_string(),
+            search_query: String::new(),
+        }
+    }
+}
+
+impl EnvEditorApp {
+    // Verbesserter Parser für präzise Erkennung aktivierter und deaktivierter Variablen
+    fn parse_file(&mut self, path: &PathBuf, is_env_target: bool) {
+        let mut file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                self.status_msg = format!("Fehler beim Öffnen: {}", e);
+                return;
+            }
+        };
+
+        let mut content = String::new();
+        if let Err(e) = file.read_to_string(&mut content) {
+            self.status_msg = format!("Fehler beim Lesen: {}", e);
+            return;
+        }
+
+        let mut new_items = Vec::new();
+        let mut current_docs = Vec::new();
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+
+            // 1. Visuelle Trennlinien ignorieren
+            if trimmed.starts_with("# ---") || trimmed.starts_with("# ──") || trimmed.starts_with("# ===") {
+                continue;
+            }
+
+            // 2. Große Sektions-Überschriften erkennen
+            if trimmed.starts_with("# ") && (trimmed.contains("CONFIGURATION") || trimmed.contains("FLAG") || trimmed.contains("BACKEND") || trimmed.contains("TUNING") || trimmed.contains("AUTHENTICATION") || trimmed.contains("COMPATIBILITY") || trimmed.contains("EMAIL") || trimmed.contains("INTERNATIONALIZATION") || trimmed.contains("PROXY")) {
+                let header_title = trimmed.trim_start_matches('#').trim().to_string();
+                new_items.push(EnvItem {
+                    key: String::new(),
+                    value: String::new(),
+                    description: String::new(),
+                    is_commented_out: false,
+                    is_header: true,
+                    header_text: header_title,
+                });
+                current_docs.clear();
+                continue;
+            }
+
+            // Bei echten Leerzeilen behalten wir die Beschreibung bei, da oft Absätze in Beschreibungen sind
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            // 3. VARIABLEN-ERKENNUNG (Die neue Logik)
+            let mut is_variable = false;
+            let mut is_commented = false;
+            let mut clean_line = trimmed;
+
+            if trimmed.contains('=') {
+                if trimmed.starts_with('#') {
+                    // Prüfen, ob nach dem '#' direkt ein Buchstabe folgt (deaktivierte Variable)
+                    // und kein Leerzeichen (was ein normaler Kommentar wäre)
+                    let after_hash = &trimmed[1..];
+                    if let Some(first_char) = after_hash.chars().next() {
+                        if first_char.is_alphabetic() {
+                            is_variable = true;
+                            is_commented = true;
+                            clean_line = after_hash.trim();
+                        }
+                    }
+                } else {
+                    // Startet direkt mit einem Buchstaben (aktivierte Variable)
+                    is_variable = true;
+                    is_commented = false;
+                }
+            }
+
+            if is_variable {
+                if let Some((key, val)) = clean_line.split_once('=') {
+                    let key = key.trim().to_string();
+                    let val = val.trim().to_string();
+                    let description = current_docs.join("\n");
+
+                    new_items.push(EnvItem {
+                        key,
+                        value: val,
+                        description,
+                        is_commented_out: is_commented,
+                        is_header: false,
+                        header_text: String::new(),
+                    });
+                    current_docs.clear(); // Beschreibung für die nächste Variable zurücksetzen
+                }
+            } else if trimmed.starts_with('#') {
+                // Es ist ein reiner Hilfetext/Kommentar -> Zur Beschreibung hinzufügen
+                let doc_line = trimmed.trim_start_matches('#').trim().to_string();
+                if !doc_line.is_empty() && !doc_line.contains("Copy this file") && !doc_line.contains("cp example.env") {
+                    current_docs.push(doc_line);
+                }
+            }
+        }
+
+        if is_env_target {
+            // Beim Laden einer echten .env gleichen wir die Werte ab
+            let mut match_count = 0;
+            for existing in &mut self.items {
+                if let Some(matching) = new_items.iter().find(|i| i.key == existing.key) {
+                    existing.value = matching.value.clone();
+                    existing.is_commented_out = matching.is_commented_out;
+                    match_count += 1;
+                }
+            }
+            self.status_msg = format!("Bestehende .env abgeglichen! {} Werte übernommen.", match_count);
+        } else {
+            self.items = new_items;
+            self.status_msg = format!("Template erfolgreich geladen! {} Variablen gefunden.", self.items.iter().filter(|i| !i.is_header).count());
+        }
+    }
+
+    fn save_env_file(&mut self, path: &PathBuf) {
+        let mut file = match File::create(path) {
+            Ok(f) => f,
+            Err(e) => {
+                self.status_msg = format!("Fehler beim Erstellen der Datei: {}", e);
+                return;
+            }
+        };
+
+        for item in &self.items {
+            if item.is_header {
+                writeln!(file, "\n# =====================================================================").unwrap();
+                writeln!(file, "# {}", item.header_text).unwrap();
+                writeln!(file, "# =====================================================================").unwrap();
+            } else {
+                if !item.description.is_empty() {
+                    for desc_line in item.description.lines() {
+                        writeln!(file, "# {}", desc_line).unwrap();
+                    }
+                }
+                if item.is_commented_out {
+                    writeln!(file, "#{}={}", item.key, item.value).unwrap();
+                } else {
+                    writeln!(file, "{}={}", item.key, item.value).unwrap();
+                }
+                writeln!(file).unwrap();
+            }
+        }
+
+        self.status_msg = format!("Gespeichert unter: {}", path.to_string_lossy());
+    }
+}
+
+impl eframe::App for EnvEditorApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                // Hier liest das Programm die Version dynamisch aus der Cargo.toml:
+                ui.heading(format!("🔒 OxiCloud .env Konfigurations-Editor v{}", env!("CARGO_PKG_VERSION")));
+            });
+            ui.add_space(5.0);
+
+            ui.horizontal(|ui| {
+                if ui.button("📁 1. Vorlage laden (example.env)").clicked() {
+                    if let Some(path) = FileDialog::new()
+                        .set_title("Wähle eine Template-Datei")
+                        .add_filter("Env-Dateien", &["env", "example"])
+                        .pick_file() 
+                    {
+                        self.example_path = Some(path.clone());
+                        self.parse_file(&path, false);
+                    }
+                }
+
+                if ui.button("🔄 2. Bestehende .env dazuladen").clicked() {
+                    if self.items.is_empty() {
+                        self.status_msg = "Fehler: Laden Sie zuerst eine Template-Datei!".to_string();
+                    } else if let Some(path) = FileDialog::new()
+                        .set_title("Wähle eine existierende .env")
+                        .add_filter("Env-Dateien", &["env"])
+                        .pick_file() 
+                    {
+                        self.env_path = Some(path.clone());
+                        self.parse_file(&path, true);
+                    }
+                }
+
+                ui.separator();
+
+                if ui.button("💾 Speichern unter...").clicked() {
+                    if let Some(path) = FileDialog::new()
+                        .set_title(".env Speichern")
+                        .set_file_name(".env")
+                        .save_file() 
+                    {
+                        self.save_env_file(&path);
+                    }
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.small(format!(
+                    "Template: {} | Ziel: {}", 
+                    self.example_path.as_ref().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).unwrap_or_else(|| "Keine".into()),
+                    self.env_path.as_ref().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).unwrap_or_else(|| "Keine".into())
+                ));
+                
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("🔍 Filter nach Key..."));
+                });
+            });
+            
+            ui.add_space(5.0);
+        });
+
+        egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&self.status_msg).color(egui::Color32::LIGHT_BLUE));
+            });
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.items.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.label("Bitte laden Sie oben eine Template-Datei, um zu beginnen.");
+                });
+                return;
+            }
+
+            egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                egui::Grid::new("env_grid")
+                    .num_columns(3)
+                    .spacing([15.0, 12.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.heading("📝 Beschreibung / Hilfetext");
+                        ui.heading("🔑 Schlüssel (Key)");
+                        ui.heading("✍️ Wert (Value)");
+                        ui.end_row();
+
+                        let search = self.search_query.to_lowercase();
+
+                        for i in 0..self.items.len() {
+                            if self.items[i].is_header {
+                                ui.end_row();
+                                ui.horizontal(|ui| {
+                                    ui.add_space(5.0);
+                                    ui.label(egui::RichText::new(&self.items[i].header_text).heading().strong().color(egui::Color32::LIGHT_GREEN));
+                                });
+                                ui.label("");
+                                ui.label("");
+                                ui.end_row();
+                                continue;
+                            }
+
+                            if !search.is_empty() && !self.items[i].key.to_lowercase().contains(&search) {
+                                continue;
+                            }
+
+                            // 1. BESCHREIBUNG
+                            ui.vertical(|ui| {
+                                ui.set_max_width(400.0);
+                                if self.items[i].description.is_empty() {
+                                    ui.weak("Keine Beschreibung vorhanden.");
+                                } else {
+                                    ui.label(egui::RichText::new(&self.items[i].description).small());
+                                }
+                            });
+
+                            // 2. KEY + CHECKBOX
+                            ui.horizontal(|ui| {
+                                let mut active = !self.items[i].is_commented_out;
+                                if ui.checkbox(&mut active, "").changed() {
+                                    self.items[i].is_commented_out = !active;
+                                }
+                                
+                                if self.items[i].is_commented_out {
+                                    ui.label(egui::RichText::new(&self.items[i].key).strikethrough().weak());
+                                } else {
+                                    ui.label(egui::RichText::new(&self.items[i].key).strong());
+                                }
+                            });
+
+                            // 3. VALUE
+                            ui.vertical(|ui| {
+                                ui.set_min_width(300.0);
+                                let is_password = self.items[i].key.contains("PASSWORD") || self.items[i].key.contains("SECRET") || self.items[i].key.contains("KEY");
+                                
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.items[i].value)
+                                        .desired_width(f32::INFINITY)
+                                        .password(is_password)
+                                );
+                            });
+
+                            ui.end_row();
+                        }
+                    });
+            });
+        });
+    }
+}
+
+fn main() -> eframe::Result<()> {
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1100.0, 800.0]),
+        ..Default::default()
+    };
+    
+    // Holt die Version (z.B. "0.1.0") direkt aus der Cargo.toml
+    let app_title = format!(".env Konfigurator v{}", env!("CARGO_PKG_VERSION"));
+    
+    eframe::run_native(
+        &app_title,
+        native_options,
+        Box::new(|_cc| Box::new(EnvEditorApp::default())),
+    )
+}
