@@ -1,3 +1,4 @@
 /target
 .env
 *.bak
+build_win.sh
