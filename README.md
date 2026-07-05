@@ -2,7 +2,7 @@
 
 Ein grafischer Editor (GUI) für Windows, entwickelt in **Rust** mit dem `eframe`/`egui`-Framework. Das Tool liest Umgebungsvariablen aus Vorlagen (z. B. `example.env`), parst die dazugehörigen Beschreibungen und ermöglicht ein sicheres, komfortables Bearbeiten und Verwalten von Konfigurationen direkt über eine Benutzeroberfläche.
 
-https://gemini.google.com hat den Großteil der Arbeit erledigt, Feinschliff und Fehlerbehebung erfolgten anschließend mit Claude.
+Gemini hat einen Teil der Arbeit erledigt, Feinschliff und Fehlerbehebung erfolgten anschließend mit Claude.
 
 ## ✨ Features
 
