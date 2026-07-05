@@ -2,9 +2,11 @@
 name = "env_editor"
 version = "0.2.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 eframe = "0.29"
 egui = "0.29"
 rfd = "0.14"
 rand = "0.8"
+
