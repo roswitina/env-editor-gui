@@ -36,5 +36,6 @@ Das Programm ist bereits vollständig kompiliert und einsatzbereit. Du musst kei
 
 ## Screenshot
 
-<img width="2215" height="1247" alt="grafik" src="https://github.com/user-attachments/assets/ffab22d9-1580-4dec-94e3-eb707746ebaa" />
+<img width="3840" height="2088" alt="grafik" src="https://github.com/user-attachments/assets/684feb01-747d-48b2-8a67-a48c590330db" />
+
 
