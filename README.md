@@ -1,50 +1,289 @@
 # 🔒 OxiCloud .env Konfigurations-Editor
 
-Ein grafischer Editor (GUI) für Windows, entwickelt in **Rust** mit dem `eframe`/`egui`-Framework. Das Tool liest Umgebungsvariablen aus Vorlagen (z. B. `example.env`), parst die dazugehörigen Beschreibungen und ermöglicht ein sicheres, komfortables Bearbeiten und Verwalten von Konfigurationen direkt über eine Benutzeroberfläche.
+Ein grafischer **.env-Konfigurationseditor für Windows**, entwickelt in **Rust** mit **eframe/egui**.
 
-Gemini hat einen Teil der Arbeit erledigt, Feinschliff und Fehlerbehebung erfolgten anschließend mit Claude.
+Das Tool liest Umgebungsvariablen aus Vorlagen (z. B. `example.env`), erkennt automatisch Beschreibungen und Sektionen und ermöglicht das komfortable Bearbeiten von Konfigurationsdateien – sowohl **lokal** als auch **direkt auf einem Server per SSH/SFTP**.
+
+> Gemini übernahm einen Teil der Grundimplementierung. Feinschliff, Fehlerbehebung sowie die vollständige SSH-/SFTP-Anbindung wurden anschließend mit Unterstützung von Claude umgesetzt.
+
+---
 
 ## ✨ Features
 
-* **Intelligenter Parser:** Erkennt sowohl aktivierte Variablen als auch auskommentierte Platzhalter (z. B. `#OXICLOUD_BASE_URL=`) und ordnet die direkt darüberliegenden Kommentare automatisch als Hilfetext zu. Echte auskommentierte Variablen (kein Leerzeichen nach `#`) werden dabei zuverlässig von reinem Hilfetext (Leerzeichen nach `#`) unterschieden.
-* **Generische Abschnitts-Erkennung:** Erkennt Sektions-Header unabhängig vom Wortlaut — sowohl mehrzeilige Trennlinien-Blöcke (`# ----- \n # TITEL \n # -----`) als auch einzeilige Header (`# --- Titel ---`, `# ── Titel ──`).
-* **Strukturierte Beschreibungen:** Hilfetexte werden in Absätze gegliedert. Der letzte Absatz (die konkrete Erklärung zum jeweiligen Schlüssel) wird hell hervorgehoben, frühere Absätze (allgemeiner Abschnittskontext) erscheinen kursiv/gedimmt. Legenden- und Listeneinträge (z. B. `587 = STARTTLS submission`, `1. ...`) bleiben dabei als ein zusammenhängender Block erhalten, statt in Einzelteile zu zerfallen.
-* **Übersichtliche GUI:** Strukturiert die Variablen visuell nach Sektionen (Überschriften) in einem sauberen 3-Spalten-Layout (Beschreibung | Schlüssel | Wert).
-* **Aktivieren/Deaktivieren per Klick:** Über Checkboxen lassen sich Variablen intuitiv ein- oder auskommentieren, ohne die Datei manuell bearbeiten zu müssen.
-* **Sicherheits-Maskierung:** Felder, die sensible Daten wie `PASSWORD`, `SECRET`, `TOKEN` oder `KEY` im Namen tragen, werden in der Benutzeroberfläche automatisch maskiert (Punkte-Ansicht) und lassen sich per 👁️/🙈-Symbol ein- und ausblenden.
-* **Eingabe-Validierung:** Felder mit `URL`, `HOST` oder `PORT` im Namen werden live validiert (z. B. muss ein Port zwischen 0 und 65535 liegen); ungültige Werte werden rot hervorgehoben.
-* **Secret-Generator:** Erzeugt auf Knopfdruck ein kryptografisch sicheres Zufalls-Secret (wahlweise 16 oder 32 Byte, als Hex-String) über den Betriebssystem-Zufallsgenerator (`OsRng`) und kopiert es automatisch in die Zwischenablage.
-* **Abgleich-Funktion:** Du kannst eine bestehende, private `.env`-Datei dazuladen. Das Programm gleicht die Werte ab und übernimmt sie direkt in die Template-Struktur.
-* **Echtzeit-Filter:** Schnelle Suche nach bestimmten Variablen (Schlüssel oder Beschreibung) über ein integriertes Suchfeld.
-* **Zeilenumbruch-Wahl:** Beim Speichern lässt sich wählen, ob die Datei mit Linux/Docker-typischen (LF) oder Windows-typischen (CRLF) Zeilenumbrüchen geschrieben wird.
-* **Automatisches Backup:** Vor dem Überschreiben einer bestehenden Datei wird automatisch eine `.bak`-Sicherungskopie angelegt.
-* **Mehrsprachig:** Komplette Benutzeroberfläche verfügbar in Deutsch, Englisch, Französisch, Spanisch und Italienisch.
-* **Dunkles High-Contrast-Theme:** Bewusst dunkel gehaltenes Farbschema mit vergrößerter Schrift und deutlich sichtbaren Eingabefeldern — unabhängig vom System-Theme des Betriebssystems.
+### 📄 Intelligenter Parser
+
+- Erkennt aktivierte Variablen und auskommentierte Platzhalter (z. B. `#OXICLOUD_BASE_URL=`)
+- Ordnet Kommentare oberhalb automatisch als Beschreibung zu
+- Unterscheidet zuverlässig zwischen:
+  - echten auskommentierten Variablen (`#VARIABLE=`)
+  - normalem Kommentartext (`# Beschreibung`)
+
+### 📑 Automatische Abschnittserkennung
+
+Unterstützt verschiedene Header-Formate, beispielsweise:
+
+```text
+# ------------------
+# Datenbank
+# ------------------
+```
+
+oder
+
+```text
+# --- Datenbank ---
+# ── Datenbank ──
+```
 
 ---
 
-## 🚀 Download & Start unter Windows
+### 📝 Strukturierte Beschreibungen
 
-Das Programm ist bereits vollständig kompiliert und einsatzbereit. Du musst keinerlei Programmierumgebungen installieren.
-
-1. Lade dir die ausführbare Datei **`env_editor.exe`** hier aus dem Repository herunter.
-2. Starte die Anwendung einfach per Doppelklick.
-3. Das Terminal-Fenster im Hintergrund wird automatisch versteckt, und die grafische Oberfläche öffnet sich sofort.
-
----
-
-## 🛠️ Technische Details
-
-* **Betriebssystem:** Windows (Nativ, 64-Bit)
-* **Programmiersprache:** Rust (Edition 2021)
-* **GUI-Framework:** `eframe` / `egui` (Immediate Mode GUI)
-* **Native Dialoge:** `rfd` (Rust File Dialog) für die Windows-Dateiauswahl
-* **Kryptografie:** `rand` (`OsRng`) für die sichere Secret-Generierung
+- Beschreibungstexte werden automatisch in Absätze gegliedert
+- Der eigentliche Hilfetext zur Variable wird hervorgehoben
+- Allgemeine Abschnittsbeschreibungen erscheinen kursiv und dezenter
+- Listen und Legenden bleiben als zusammenhängender Block erhalten
 
 ---
 
-## Screenshot
+### 🖥️ Komfortable GUI
+
+- Übersichtliches 3-Spalten-Layout
+  - Beschreibung
+  - Schlüssel
+  - Wert
+- Gruppierung nach Sektionen
+- Sofortiges Bearbeiten aller Variablen
+
+---
+
+### ✅ Variablen aktivieren oder deaktivieren
+
+Per Checkbox können Variablen ein- oder auskommentiert werden, ohne die Datei manuell bearbeiten zu müssen.
+
+---
+
+### 🔐 Automatische Maskierung sensibler Daten
+
+Variablen mit Namen wie
+
+- `PASSWORD`
+- `SECRET`
+- `TOKEN`
+- `KEY`
+
+werden automatisch verborgen.
+
+Über das 👁️/🙈-Symbol lassen sie sich jederzeit ein- oder ausblenden.
+
+---
+
+### ✔ Live-Validierung
+
+Folgende Felder werden automatisch geprüft:
+
+- `URL`
+- `HOST`
+- `PORT`
+
+Ungültige Werte werden sofort farblich hervorgehoben.
+
+---
+
+### 🔑 Secret-Generator
+
+Erzeugt kryptographisch sichere Zufallswerte über `OsRng`.
+
+Unterstützt:
+
+- 16 Byte (Hex)
+- 32 Byte (Hex)
+
+Das Secret wird automatisch in die Zwischenablage kopiert.
+
+---
+
+### 🔄 Abgleich mit vorhandener `.env`
+
+Eine bestehende private `.env` kann geladen werden.
+
+Vorhandene Werte werden automatisch in die Template-Struktur übernommen.
+
+---
+
+### 🔍 Echtzeit-Suche
+
+Filter nach
+
+- Variablennamen
+- Beschreibung
+
+während der Eingabe.
+
+---
+
+### 💾 Flexible Speicherung
+
+- Linux-/Docker-Zeilenumbrüche (LF)
+- Windows-Zeilenumbrüche (CRLF)
+
+---
+
+### 🛡 Automatische Backups
+
+Vor jedem Überschreiben wird automatisch eine `.bak`-Datei erzeugt.
+
+Funktioniert sowohl
+
+- lokal
+- als auch auf dem Server.
+
+---
+
+### 🌍 Mehrsprachig
+
+Die komplette Oberfläche ist verfügbar in
+
+- 🇩🇪 Deutsch
+- 🇬🇧 Englisch
+- 🇫🇷 Französisch
+- 🇪🇸 Spanisch
+- 🇮🇹 Italienisch
+
+---
+
+### 🌙 High-Contrast Dark Theme
+
+- dunkles Farbschema
+- größere Schrift
+- kontrastreiche Eingabefelder
+
+Unabhängig vom Windows-Systemtheme.
+
+---
+
+# 🌐 Direktes Bearbeiten per SSH/SFTP
+
+## SSH/SFTP-Verbindung
+
+Direktes Öffnen von
+
+- `example.env`
+- `.env.example`
+- `.env`
+
+auf einem Server.
+
+Unterstützt:
+
+- Passwort
+- SSH-Key
+- verschlüsselten SSH-Key
+
+Es wird **kein separater SFTP-Client** benötigt.
+
+---
+
+## 📁 Ordner-Browser
+
+Nach erfolgreicher Verbindung kann der Zielordner bequem durchsucht werden.
+
+Unterstützt:
+
+- Unterordner
+- Übergeordneten Ordner
+- erneute Dateisuche ohne Neuverbindung
+
+---
+
+## 🔒 Sichere Zugangsdaten
+
+Optional speicherbar:
+
+- Host
+- Port
+- Benutzername
+- Authentifizierungsmethode
+
+Passwörter und Passphrasen werden **niemals im Klartext gespeichert**, sondern verschlüsselt im Betriebssystem-Schlüsselbund.
+
+| Betriebssystem | Speicherung |
+|---------------|------------|
+| Windows | Credential Manager |
+| macOS | Keychain |
+| Linux | Secret Service |
+
+---
+
+## 🛡 Host-Key-Prüfung (TOFU)
+
+Beim ersten Verbindungsaufbau wird der Server-Fingerabdruck gespeichert.
+
+Ändert sich dieser später unerwartet, wird die Verbindung mit einer Warnung abgelehnt.
+
+Dadurch werden mögliche **Man-in-the-Middle-Angriffe** erkannt.
+
+---
+
+## ☁ Direkt auf dem Server speichern
+
+Änderungen können unmittelbar zurückgeschrieben werden.
+
+Dabei wird automatisch eine `.bak`-Datei auf dem Server angelegt.
+
+---
+
+## 🔌 Verbindung trennen
+
+Über **„🔌 Trennen“** kann die SSH-Verbindung jederzeit sauber beendet werden.
+
+---
+
+# 🚀 Installation
+
+Es ist **keine Rust-Installation erforderlich**.
+
+1. Lade die aktuelle `env_editor.exe` aus den **Releases** herunter.
+2. Starte die Datei per Doppelklick.
+3. Das Konsolenfenster bleibt verborgen.
+4. Die grafische Oberfläche startet sofort.
+
+---
+
+# 🛠 Technische Details
+
+| Komponente | Beschreibung |
+|------------|--------------|
+| Betriebssystem | Windows (64-Bit) |
+| Sprache | Rust 2021 |
+| GUI | `eframe` / `egui` |
+| Dateidialoge | `rfd` |
+| Kryptografie | `rand` (`OsRng`) |
+| SSH/SFTP | `russh` + `russh-sftp` |
+| Async Runtime | `tokio` |
+| Credential Store | `keyring` |
+| Konfigurationsdateien | `serde`, `serde_json` |
+| Benutzerpfade | `dirs` |
+
+---
+
+# 📸 Screenshots
 
 <img width="1920" height="1044" alt="env_editor_v0 2 0" src="https://github.com/user-attachments/assets/e7e84dc0-9847-4198-aa4e-439ce4058e78" />
+<img width="1015" height="698" alt="env_editor_v0 3 0-with_ssh" src="https://github.com/user-attachments/assets/31672bb4-611e-4335-b328-d2f55d01aeb2" />
+
+---
+
+# 📄 Lizenz
+
+Dieses Projekt steht unter der MIT-Lizenz.
+
+---
+
+# ❤️ Mitwirkende
+
+- Eigenentwicklung
+- Unterstützung durch Gemini (Grundimplementierung)
+- Unterstützung durch Claude (Feinschliff, SSH/SFTP und Fehlerbehebung)
 
 
