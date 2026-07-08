@@ -7,6 +7,8 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+mod remote;
+
 // =============================================================================
 //  Sprachen
 // =============================================================================
@@ -317,6 +319,65 @@ struct EnvEditorApp {
     current_lang: Language,
     target_os: TargetOsFormat,
     secret_len: SecretLength,
+
+    // ---------- Remote (SSH/SFTP) ----------
+    /// Steuert die Sichtbarkeit des "SSH-Verbindung"-Fensters.
+    remote_window_open: bool,
+    /// Aktive SSH/SFTP-Sitzung, sofern gerade verbunden.
+    remote_session: Option<remote::RemoteSession>,
+    /// Remote-Pfad der zuletzt geladenen/abgeglichenen .env-Datei. Ziel für
+    /// "Auf Server speichern".
+    remote_active_path: Option<String>,
+    /// Gespeicherte Verbindungsprofile (ohne Geheimnisse, die liegen im
+    /// OS-Schlüsselbund).
+    remote_saved_connections: Vec<remote::SavedConnection>,
+    /// Eingabefelder des Verbindungsdialogs.
+    remote_form: RemoteForm,
+    /// Im Remote-Verzeichnis gefundene Dateien aus
+    /// {example.env, .env.example, .env}.
+    remote_found_files: Vec<String>,
+    /// Inhalt des aktuell angezeigten Remote-Verzeichnisses (zum
+    /// Durchklicken, statt den Pfad blind eintippen zu müssen).
+    remote_dir_entries: Vec<remote::RemoteDirEntry>,
+    /// Status-/Fehlermeldungen speziell für den Remote-Dialog.
+    remote_status: String,
+}
+
+/// Eingabefelder des "SSH-Verbindung"-Dialogs. Getrennt von den gespeicherten
+/// Profilen (`remote::SavedConnection`), damit man ein Profil laden, die
+/// Felder anpassen und trotzdem das Original unverändert lassen kann.
+struct RemoteForm {
+    profile_name: String,
+    host: String,
+    port: String,
+    username: String,
+    auth_kind: remote::AuthKind,
+    password: String,
+    show_password: bool,
+    key_path: Option<PathBuf>,
+    key_passphrase: String,
+    remote_dir: String,
+    /// Wenn aktiv, werden Profil + Zugangsdaten (im OS-Schlüsselbund) nach
+    /// erfolgreichem Verbindungsaufbau gespeichert.
+    remember: bool,
+}
+
+impl Default for RemoteForm {
+    fn default() -> Self {
+        Self {
+            profile_name: String::new(),
+            host: String::new(),
+            port: "22".to_string(),
+            username: String::new(),
+            auth_kind: remote::AuthKind::Password,
+            password: String::new(),
+            show_password: false,
+            key_path: None,
+            key_passphrase: String::new(),
+            remote_dir: ".".to_string(),
+            remember: false,
+        }
+    }
 }
 
 impl Default for EnvEditorApp {
@@ -331,6 +392,15 @@ impl Default for EnvEditorApp {
             current_lang: default_lang,
             target_os: TargetOsFormat::Linux,
             secret_len: SecretLength::Bytes32,
+
+            remote_window_open: false,
+            remote_session: None,
+            remote_active_path: None,
+            remote_saved_connections: remote::load_connections(),
+            remote_form: RemoteForm::default(),
+            remote_found_files: Vec::new(),
+            remote_dir_entries: Vec::new(),
+            remote_status: String::new(),
         }
     }
 }
@@ -425,6 +495,12 @@ impl EnvEditorApp {
         file.read_to_string(&mut content)
             .map_err(|e| self.current_lang.translate("err_read").replace("{}", &e.to_string()))?;
 
+        self.parse_str(&content)
+    }
+
+    /// Kern der .env-Parsing-Logik, unabhängig von der Quelle (lokale Datei
+    /// oder per SFTP von einem Remote-Server gelesener Inhalt).
+    fn parse_str(&self, content: &str) -> Result<Vec<EnvItem>, String> {
         let lines: Vec<&str> = content.lines().collect();
         let mut items: Vec<EnvItem> = Vec::new();
         // Jeder Eintrag ist ein zusammenhängender Absatz. Zeilen ohne
@@ -634,6 +710,22 @@ impl EnvEditorApp {
             }
         };
 
+        let match_count = self.merge_items(&new_items);
+        self.env_path = Some(path);
+        self.status_msg = format!(
+            "{} {}",
+            self.current_lang.translate("status_env_ok"),
+            self.current_lang
+                .translate("count_merged")
+                .replace("{}", &match_count.to_string())
+        );
+    }
+
+    /// Übernimmt Werte/Kommentar-Status aus `new_items` in `self.items`
+    /// anhand des Keys. Gibt die Anzahl übernommener Werte zurück. Von
+    /// `merge_env` (lokale Datei) und `remote_merge` (SFTP) gemeinsam
+    /// genutzt.
+    fn merge_items(&mut self, new_items: &[EnvItem]) -> usize {
         let mut match_count: usize = 0;
         for existing in self.items.iter_mut() {
             if let EnvItem::Variable {
@@ -657,14 +749,7 @@ impl EnvEditorApp {
                 }
             }
         }
-        self.env_path = Some(path);
-        self.status_msg = format!(
-            "{} {}",
-            self.current_lang.translate("status_env_ok"),
-            self.current_lang
-                .translate("count_merged")
-                .replace("{}", &match_count.to_string())
-        );
+        match_count
     }
 
     // ---------- Backup & Save ----------
@@ -701,6 +786,65 @@ impl EnvEditorApp {
         Ok(backup_path)
     }
 
+    /// Serialisiert die aktuellen Items als .env-Text (mit den gewählten
+    /// Zeilenumbrüchen). Gemeinsam genutzt vom lokalen Speichern
+    /// (`save_env_file`) und vom Speichern auf einen Remote-Server
+    /// (`remote_save_active`).
+    fn serialize_env(&self) -> String {
+        use std::fmt::Write as _;
+        let eol = self.target_os.eol();
+        let mut out = String::new();
+
+        for item in &self.items {
+            match item {
+                EnvItem::Header { text } => {
+                    // Header werden im Ein-Zeilen-Format geschrieben, das der
+                    // Parser (is_inline_header) generisch erkennt:
+                    // "# ===== TITEL =====". Dadurch bleibt ein Speichern/Laden-
+                    // Roundtrip konsistent, statt den Titel beim erneuten Einlesen
+                    // als Beschreibungstext misszuinterpretieren.
+                    let _ = write!(out, "# {:=^69}", format!(" {} ", text));
+                    out.push_str(eol);
+                }
+                EnvItem::Variable {
+                    key,
+                    value,
+                    description,
+                    is_commented_out,
+                    ..
+                } => {
+                    if !description.is_empty() {
+                        for (idx, paragraph) in description.iter().enumerate() {
+                            if idx > 0 {
+                                // Leerzeile zwischen Absätzen, damit der Parser
+                                // die Absatzgrenzen beim erneuten Laden wieder
+                                // exakt so erkennt (Roundtrip-Konsistenz).
+                                out.push('#');
+                                out.push_str(eol);
+                            }
+                            // Ein Absatz kann interne Zeilenumbrüche enthalten
+                            // (z.B. bei Legenden-/Listen-Einträgen) — jede davon
+                            // braucht ihr eigenes "# "-Präfix.
+                            for line in paragraph.lines() {
+                                let _ = write!(out, "# {}", line);
+                                out.push_str(eol);
+                            }
+                        }
+                    }
+                    if *is_commented_out {
+                        let _ = write!(out, "#{}={}", key, value);
+                    } else {
+                        let _ = write!(out, "{}={}", key, value);
+                    }
+                    out.push_str(eol);
+                    out.push_str(eol);
+                }
+            }
+        }
+
+        out
+    }
+
     fn save_env_file(&mut self, path: &PathBuf) {
         // Backup nur, wenn die Datei existiert
         if path.exists() {
@@ -724,59 +868,9 @@ impl EnvEditorApp {
             }
         };
         let mut writer = BufWriter::new(file);
-        let eol = self.target_os.eol();
+        let content = self.serialize_env();
 
-        let write_result: std::io::Result<()> = (|| {
-            for item in &self.items {
-                match item {
-                    EnvItem::Header { text } => {
-                        // Header werden im Ein-Zeilen-Format geschrieben, das der
-                        // Parser (is_inline_header) generisch erkennt:
-                        // "# ===== TITEL =====". Dadurch bleibt ein Speichern/Laden-
-                        // Roundtrip konsistent, statt den Titel beim erneuten Einlesen
-                        // als Beschreibungstext misszuinterpretieren.
-                        write!(writer, "# {:=^69}", format!(" {} ", text))?;
-                        writer.write_all(eol.as_bytes())?;
-                    }
-                    EnvItem::Variable {
-                        key,
-                        value,
-                        description,
-                        is_commented_out,
-                        ..
-                    } => {
-                        if !description.is_empty() {
-                            for (idx, paragraph) in description.iter().enumerate() {
-                                if idx > 0 {
-                                    // Leerzeile zwischen Absätzen, damit der Parser
-                                    // die Absatzgrenzen beim erneuten Laden wieder
-                                    // exakt so erkennt (Roundtrip-Konsistenz).
-                                    write!(writer, "#")?;
-                                    writer.write_all(eol.as_bytes())?;
-                                }
-                                // Ein Absatz kann interne Zeilenumbrüche enthalten
-                                // (z.B. bei Legenden-/Listen-Einträgen) — jede davon
-                                // braucht ihr eigenes "# "-Präfix.
-                                for line in paragraph.lines() {
-                                    write!(writer, "# {}", line)?;
-                                    writer.write_all(eol.as_bytes())?;
-                                }
-                            }
-                        }
-                        if *is_commented_out {
-                            write!(writer, "#{}={}", key, value)?;
-                        } else {
-                            write!(writer, "{}={}", key, value)?;
-                        }
-                        writer.write_all(eol.as_bytes())?;
-                        writer.write_all(eol.as_bytes())?;
-                    }
-                }
-            }
-            Ok(())
-        })();
-
-        if let Err(e) = write_result {
+        if let Err(e) = writer.write_all(content.as_bytes()) {
             self.status_msg = self
                 .current_lang
                 .translate("err_write")
@@ -788,6 +882,305 @@ impl EnvEditorApp {
             .current_lang
             .translate("saved_to")
             .replace("{}", &path.to_string_lossy());
+    }
+
+    // ---------- Remote (SSH/SFTP) ----------
+
+    /// Beendet die aktuelle SSH/SFTP-Sitzung und setzt den zugehörigen
+    /// Remote-Zustand zurück. Bereits geladene Items in der Tabelle bleiben
+    /// unangetastet — nur die Verbindung und ihr "Speicherziel" fallen weg.
+    fn remote_disconnect(&mut self) {
+        self.remote_session = None;
+        self.remote_active_path = None;
+        self.remote_found_files.clear();
+        self.remote_dir_entries.clear();
+        self.remote_status = "Verbindung getrennt.".to_string();
+    }
+
+    /// Baut anhand der Formularfelder eine SSH/SFTP-Verbindung auf, listet
+    /// anschließend {example.env, .env.example, .env} im gewählten
+    /// Remote-Verzeichnis auf und speichert das Profil optional
+    /// (Zugangsdaten im OS-Schlüsselbund, keine Klartext-Speicherung).
+    fn remote_connect(&mut self) {
+        let port: u16 = match self.remote_form.port.trim().parse() {
+            Ok(p) => p,
+            Err(_) => {
+                self.remote_status = "Ungültiger Port.".to_string();
+                return;
+            }
+        };
+
+        if self.remote_form.host.trim().is_empty() || self.remote_form.username.trim().is_empty()
+        {
+            self.remote_status = "Bitte Host und Benutzername angeben.".to_string();
+            return;
+        }
+
+        let auth = match self.remote_form.auth_kind {
+            remote::AuthKind::Password => {
+                remote::Auth::Password(self.remote_form.password.clone())
+            }
+            remote::AuthKind::Key => {
+                let Some(path) = self.remote_form.key_path.clone() else {
+                    self.remote_status = "Bitte eine Schlüsseldatei wählen.".to_string();
+                    return;
+                };
+                let passphrase = if self.remote_form.key_passphrase.is_empty() {
+                    None
+                } else {
+                    Some(self.remote_form.key_passphrase.clone())
+                };
+                remote::Auth::Key { path, passphrase }
+            }
+        };
+
+        let params = remote::ConnectParams {
+            host: self.remote_form.host.trim().to_string(),
+            port,
+            username: self.remote_form.username.trim().to_string(),
+            auth,
+        };
+
+        match remote::RemoteSession::connect(&params) {
+            Ok(session) => {
+                let host_key_note = session.new_host_key_fingerprint.clone();
+                self.remote_session = Some(session);
+                self.remote_refresh(self.remote_form.remote_dir.trim().to_string().as_str());
+
+                if let Some(fp) = host_key_note {
+                    self.remote_status =
+                        format!("Neuer Host-Key akzeptiert und gespeichert ({fp}). {}", self.remote_status);
+                }
+
+                if self.remote_form.remember {
+                    let name = if self.remote_form.profile_name.trim().is_empty() {
+                        format!("{}@{}", self.remote_form.username, self.remote_form.host)
+                    } else {
+                        self.remote_form.profile_name.trim().to_string()
+                    };
+                    let conn = remote::SavedConnection {
+                        name,
+                        host: self.remote_form.host.trim().to_string(),
+                        port,
+                        username: self.remote_form.username.trim().to_string(),
+                        auth_kind: self.remote_form.auth_kind,
+                        key_path: self.remote_form.key_path.clone(),
+                        has_secret: false,
+                    };
+                    let secret = match self.remote_form.auth_kind {
+                        remote::AuthKind::Password => Some(self.remote_form.password.as_str()),
+                        remote::AuthKind::Key if !self.remote_form.key_passphrase.is_empty() => {
+                            Some(self.remote_form.key_passphrase.as_str())
+                        }
+                        remote::AuthKind::Key => None,
+                    };
+                    match remote::save_connection(conn, secret) {
+                        Ok(_) => self.remote_saved_connections = remote::load_connections(),
+                        Err(e) => {
+                            self.remote_status =
+                                format!("Verbunden, aber Profil-Speichern fehlgeschlagen: {e}")
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                self.remote_session = None;
+                self.remote_found_files.clear();
+                self.remote_dir_entries.clear();
+                self.remote_status = e;
+            }
+        }
+    }
+
+    /// Listet ein Remote-Verzeichnis neu (Unterordner zum Durchklicken +
+    /// Suche nach {example.env, .env.example, .env}), OHNE die Verbindung
+    /// neu aufzubauen. Wird beim Navigieren per Klick und beim manuellen
+    /// erneuten Suchen nach Pfad-Änderung verwendet.
+    fn remote_refresh(&mut self, dir: &str) {
+        if self.remote_session.is_none() {
+            self.remote_status = "Keine aktive Verbindung.".to_string();
+            return;
+        }
+        self.remote_form.remote_dir = dir.to_string();
+
+        match self.remote_session.as_ref().unwrap().list_dir(dir) {
+            Ok(entries) => self.remote_dir_entries = entries,
+            Err(e) => {
+                self.remote_dir_entries.clear();
+                self.remote_status = format!("Verzeichnis konnte nicht gelistet werden: {e}");
+                return;
+            }
+        }
+
+        match self.remote_session.as_ref().unwrap().find_env_files(dir) {
+            Ok(files) => {
+                self.remote_found_files = files;
+                self.remote_status = format!(
+                    "{} .env-Datei(en) gefunden, {} Einträge in „{}“.",
+                    self.remote_found_files.len(),
+                    self.remote_dir_entries.len(),
+                    dir
+                );
+            }
+            Err(e) => {
+                self.remote_found_files.clear();
+                self.remote_status = format!("Suche fehlgeschlagen: {e}");
+            }
+        }
+    }
+
+    /// Navigiert in der Ordner-Ansicht: `name == ".."` geht eine Ebene
+    /// hoch, jeder andere Name wird als Unterordner angehängt.
+    fn remote_navigate(&mut self, name: &str) {
+        let current = self.remote_form.remote_dir.trim().to_string();
+        let next = if name == ".." {
+            match current.rsplit_once('/') {
+                Some((parent, _)) if !parent.is_empty() => parent.to_string(),
+                _ => "/".to_string(),
+            }
+        } else if current.is_empty() || current == "." {
+            name.to_string()
+        } else {
+            format!("{}/{}", current.trim_end_matches('/'), name)
+        };
+        self.remote_refresh(&next);
+    }
+
+    /// Übernimmt Host/Port/Benutzer/Auth-Art eines gespeicherten Profils ins
+    /// Formular und lädt — falls vorhanden — das zugehörige Geheimnis aus
+    /// dem OS-Schlüsselbund.
+    fn remote_apply_saved(&mut self, idx: usize) {
+        if let Some(conn) = self.remote_saved_connections.get(idx).cloned() {
+            self.remote_form.profile_name = conn.name.clone();
+            self.remote_form.host = conn.host.clone();
+            self.remote_form.port = conn.port.to_string();
+            self.remote_form.username = conn.username.clone();
+            self.remote_form.auth_kind = conn.auth_kind;
+            self.remote_form.key_path = conn.key_path.clone();
+            self.remote_form.remember = true;
+            self.remote_form.password.clear();
+            self.remote_form.key_passphrase.clear();
+
+            if conn.has_secret {
+                if let Some(secret) = remote::load_secret(&conn) {
+                    match conn.auth_kind {
+                        remote::AuthKind::Password => self.remote_form.password = secret,
+                        remote::AuthKind::Key => self.remote_form.key_passphrase = secret,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Löscht ein gespeichertes Profil samt Geheimnis im Schlüsselbund.
+    fn remote_delete_saved(&mut self, idx: usize) {
+        if idx < self.remote_saved_connections.len() {
+            let conn = self.remote_saved_connections.remove(idx);
+            if let Err(e) = remote::delete_connection(&conn) {
+                self.remote_status = e;
+            }
+        }
+    }
+
+    /// Lädt eine Remote-Datei als neue Vorlage (analog zu `load_template`,
+    /// nur dass der Inhalt per SFTP statt lokal gelesen wird).
+    fn remote_load_as_template(&mut self, remote_path: String) {
+        let Some(session) = &self.remote_session else {
+            self.remote_status = "Keine aktive Verbindung.".to_string();
+            return;
+        };
+        let content = match session.read_file(&remote_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.remote_status = e;
+                return;
+            }
+        };
+        match self.parse_str(&content) {
+            Ok(items) => {
+                let count = items
+                    .iter()
+                    .filter(|i| matches!(i, EnvItem::Variable { .. }))
+                    .count();
+                self.items = items;
+                self.example_path = None;
+                self.env_path = None;
+                self.remote_active_path = Some(remote_path.clone());
+                self.status_msg = format!(
+                    "{} {}",
+                    self.current_lang.translate("status_template_ok"),
+                    self.current_lang
+                        .translate("count_vars")
+                        .replace("{}", &count.to_string())
+                );
+                self.remote_status = format!("Als Vorlage geladen: {remote_path}");
+                // Nach erfolgreichem Laden macht das Verbindungsfenster den
+                // Blick auf die Tabelle nur noch frei — schließen, statt den
+                // Nutzer es manuell verkleinern/verschieben zu lassen. Über
+                // den Button lässt es sich jederzeit wieder öffnen, die
+                // Verbindung bleibt dabei aktiv.
+                self.remote_window_open = false;
+            }
+            Err(msg) => self.status_msg = msg,
+        }
+    }
+
+    /// Gleicht eine Remote-Datei mit den bereits geladenen Items ab (analog
+    /// zu `merge_env`) und merkt sich den Pfad als Ziel für
+    /// "Auf Server speichern".
+    fn remote_merge(&mut self, remote_path: String) {
+        let Some(session) = &self.remote_session else {
+            self.remote_status = "Keine aktive Verbindung.".to_string();
+            return;
+        };
+        let content = match session.read_file(&remote_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.remote_status = e;
+                return;
+            }
+        };
+        let new_items = match self.parse_str(&content) {
+            Ok(v) => v,
+            Err(msg) => {
+                self.status_msg = msg;
+                return;
+            }
+        };
+
+        let match_count = self.merge_items(&new_items);
+        self.remote_active_path = Some(remote_path.clone());
+        self.remote_status = format!(
+            "{} {}",
+            self.current_lang.translate("status_env_ok"),
+            self.current_lang
+                .translate("count_merged")
+                .replace("{}", &match_count.to_string())
+        );
+        // Gleicher Grund wie bei remote_load_as_template: nach dem Abgleich
+        // will der Nutzer die Tabelle sehen, nicht den Dialog.
+        self.remote_window_open = false;
+    }
+
+    /// Schreibt den aktuellen Stand auf den zuletzt geladenen/abgeglichenen
+    /// Remote-Pfad zurück. Legt vorher — analog zum lokalen Speichern — ein
+    /// `<datei>.bak` mit dem alten Inhalt an.
+    fn remote_save_active(&mut self) {
+        let Some(path) = self.remote_active_path.clone() else {
+            self.remote_status =
+                "Keine Remote-Zieldatei ausgewählt (erst laden/abgleichen).".to_string();
+            return;
+        };
+        let Some(session) = &self.remote_session else {
+            self.remote_status = "Keine aktive Verbindung.".to_string();
+            return;
+        };
+
+        let content = self.serialize_env();
+        match session.write_file(&path, &content) {
+            Ok(_) => self.remote_status = format!("Auf Server gespeichert: {path}"),
+            Err(e) => self.remote_status = e,
+        }
     }
 
     // ---------- Secret-Generierung ----------
@@ -896,6 +1289,7 @@ impl eframe::App for EnvEditorApp {
         self.render_top_panel(ctx);
         self.render_bottom_panel(ctx);
         self.render_central_panel(ctx);
+        self.render_remote_window(ctx);
     }
 }
 
@@ -986,6 +1380,35 @@ impl EnvEditorApp {
                         .save_file()
                     {
                         self.save_env_file(&path);
+                    }
+                }
+
+                ui.separator();
+
+                if ui.button("🌐 SSH-Verbindung...").clicked() {
+                    self.remote_window_open = true;
+                }
+
+                let has_remote_target =
+                    self.remote_session.is_some() && self.remote_active_path.is_some();
+                if ui
+                    .add_enabled(has_remote_target, egui::Button::new("☁ Auf Server speichern"))
+                    .on_hover_text(
+                        "Speichert die aktuelle Konfiguration auf die zuletzt geladene \
+                         Remote-Datei zurück (legt vorher ein .bak an).",
+                    )
+                    .clicked()
+                {
+                    self.remote_save_active();
+                }
+
+                if self.remote_session.is_some() {
+                    if ui
+                        .button("🔌 Trennen")
+                        .on_hover_text("Beendet die SSH-Verbindung zum Server.")
+                        .clicked()
+                    {
+                        self.remote_disconnect();
                     }
                 }
 
@@ -1233,6 +1656,291 @@ impl EnvEditorApp {
                         });
                 });
         });
+    }
+}
+
+impl EnvEditorApp {
+    /// Zeigt den Dialog zum Verbinden mit einem Server per SSH/SFTP, das
+    /// Verwalten gespeicherter Profile sowie die Auswahl von
+    /// {example.env, .env.example, .env} im gewählten Remote-Verzeichnis.
+    fn render_remote_window(&mut self, ctx: &egui::Context) {
+        if !self.remote_window_open {
+            return;
+        }
+
+        let mut open = self.remote_window_open;
+        egui::Window::new("🌐 SSH-Verbindung")
+            .open(&mut open)
+            .default_width(480.0)
+            .default_pos(egui::pos2(20.0, 40.0))
+            .show(ctx, |ui| {
+                // ---------- Gespeicherte Profile ----------
+                if !self.remote_saved_connections.is_empty() {
+                    ui.label("Gespeicherte Verbindungen:");
+                    let mut apply_idx: Option<usize> = None;
+                    let mut delete_idx: Option<usize> = None;
+                    ui.horizontal_wrapped(|ui| {
+                        for (idx, conn) in self.remote_saved_connections.iter().enumerate() {
+                            ui.group(|ui| {
+                                if ui
+                                    .button(format!("{} ({}@{})", conn.name, conn.username, conn.host))
+                                    .clicked()
+                                {
+                                    apply_idx = Some(idx);
+                                }
+                                if ui.small_button("🗑").on_hover_text("Profil löschen").clicked() {
+                                    delete_idx = Some(idx);
+                                }
+                            });
+                        }
+                    });
+                    if let Some(idx) = apply_idx {
+                        self.remote_apply_saved(idx);
+                    }
+                    if let Some(idx) = delete_idx {
+                        self.remote_delete_saved(idx);
+                    }
+                    ui.separator();
+                }
+
+                // ---------- Verbindungsdaten ----------
+                egui::Grid::new("remote_conn_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Host:");
+                        ui.text_edit_singleline(&mut self.remote_form.host);
+                        ui.end_row();
+
+                        ui.label("Port:");
+                        ui.text_edit_singleline(&mut self.remote_form.port);
+                        ui.end_row();
+
+                        ui.label("Benutzername:");
+                        ui.text_edit_singleline(&mut self.remote_form.username);
+                        ui.end_row();
+
+                        ui.label("Authentifizierung:");
+                        ui.horizontal(|ui| {
+                            ui.radio_value(
+                                &mut self.remote_form.auth_kind,
+                                remote::AuthKind::Password,
+                                "Passwort",
+                            );
+                            ui.radio_value(
+                                &mut self.remote_form.auth_kind,
+                                remote::AuthKind::Key,
+                                "SSH-Key",
+                            );
+                        });
+                        ui.end_row();
+
+                        match self.remote_form.auth_kind {
+                            remote::AuthKind::Password => {
+                                ui.label("Passwort:");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.remote_form.password)
+                                            .password(!self.remote_form.show_password)
+                                            .desired_width(200.0),
+                                    );
+                                    let icon =
+                                        if self.remote_form.show_password { "👁" } else { "🙈" };
+                                    if ui.button(icon).clicked() {
+                                        self.remote_form.show_password =
+                                            !self.remote_form.show_password;
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                            remote::AuthKind::Key => {
+                                ui.label("Schlüsseldatei:");
+                                ui.horizontal(|ui| {
+                                    let label = self
+                                        .remote_form
+                                        .key_path
+                                        .as_ref()
+                                        .map(|p| p.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "Keine ausgewählt".to_string());
+                                    ui.label(label);
+                                    if ui.button("Datei wählen...").clicked() {
+                                        if let Some(path) = FileDialog::new()
+                                            .set_title("Privaten SSH-Key wählen")
+                                            .pick_file()
+                                        {
+                                            self.remote_form.key_path = Some(path);
+                                        }
+                                    }
+                                });
+                                ui.end_row();
+
+                                ui.label("Passphrase (optional):");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.remote_form.key_passphrase)
+                                        .password(true)
+                                        .desired_width(200.0),
+                                );
+                                ui.end_row();
+                            }
+                        }
+
+                        ui.label("Remote-Verzeichnis:");
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(&mut self.remote_form.remote_dir);
+                            if ui
+                                .add_enabled(
+                                    self.remote_session.is_some(),
+                                    egui::Button::new("🔎"),
+                                )
+                                .on_hover_text(
+                                    "Diesen Ordner durchsuchen / neu einlesen (ohne neu zu \
+                                     verbinden)",
+                                )
+                                .clicked()
+                            {
+                                let dir = self.remote_form.remote_dir.trim().to_string();
+                                self.remote_refresh(&dir);
+                            }
+                        });
+                        ui.end_row();
+                    });
+
+                ui.add_space(6.0);
+                ui.checkbox(
+                    &mut self.remote_form.remember,
+                    "Zugangsdaten speichern (im System-Schlüsselbund)",
+                );
+                if self.remote_form.remember {
+                    ui.horizontal(|ui| {
+                        ui.label("Profilname:");
+                        let mut hint = self.remote_form.profile_name.clone();
+                        if hint.is_empty() {
+                            hint = format!(
+                                "{}@{}",
+                                self.remote_form.username, self.remote_form.host
+                            );
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.remote_form.profile_name)
+                                .hint_text(hint),
+                        );
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "Host/Benutzer werden lokal als JSON gespeichert, das Passwort bzw. \
+                             die Passphrase liegt verschlüsselt im Schlüsselbund des Betriebssystems.",
+                        )
+                        .small()
+                        .color(egui::Color32::GRAY),
+                    );
+                }
+
+                ui.add_space(8.0);
+                if ui.button("🔌 Verbinden").clicked() {
+                    self.remote_connect();
+                }
+
+                if !self.remote_status.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(&self.remote_status);
+                }
+
+                // ---------- Ordner-Browser ----------
+                if self.remote_session.is_some() {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(format!("📂 {}", self.remote_form.remote_dir));
+                        if ui.small_button("⬆ Übergeordneter Ordner").clicked() {
+                            self.remote_navigate("..");
+                        }
+                    });
+
+                    let dirs: Vec<&remote::RemoteDirEntry> = self
+                        .remote_dir_entries
+                        .iter()
+                        .filter(|e| e.is_dir)
+                        .collect();
+
+                    if dirs.is_empty() {
+                        ui.label(
+                            egui::RichText::new("(keine Unterordner)")
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        );
+                    } else {
+                        let mut navigate_to: Option<String> = None;
+                        egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                            for entry in &dirs {
+                                if ui.button(format!("📁 {}", entry.name)).clicked() {
+                                    navigate_to = Some(entry.name.clone());
+                                }
+                            }
+                        });
+                        if let Some(name) = navigate_to {
+                            self.remote_navigate(&name);
+                        }
+                    }
+                }
+
+                // ---------- Gefundene Dateien ----------
+                if self.remote_session.is_some() {
+                    ui.separator();
+                    if self.remote_found_files.is_empty() {
+                        ui.label(
+                            "Keine der Dateien example.env / .env.example / .env im \
+                             angegebenen Verzeichnis gefunden.",
+                        );
+                    } else {
+                        ui.label("Gefundene Dateien:");
+                        let mut load_template: Option<String> = None;
+                        let mut load_merge: Option<String> = None;
+                        for path in &self.remote_found_files {
+                            ui.horizontal(|ui| {
+                                ui.label(path);
+                                if ui
+                                    .button("Als Vorlage laden")
+                                    .on_hover_text(
+                                        "Ersetzt die aktuelle Ansicht komplett durch diese Datei.",
+                                    )
+                                    .clicked()
+                                {
+                                    load_template = Some(path.clone());
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !self.items.is_empty(),
+                                        egui::Button::new("Mit dieser abgleichen"),
+                                    )
+                                    .on_hover_text(
+                                        "Übernimmt Werte aus dieser Datei in die bereits \
+                                         geladene Vorlage (wie \"2. Bestehende .env dazuladen\").",
+                                    )
+                                    .clicked()
+                                {
+                                    load_merge = Some(path.clone());
+                                }
+                            });
+                        }
+                        if let Some(path) = load_template {
+                            self.remote_load_as_template(path);
+                        }
+                        if let Some(path) = load_merge {
+                            self.remote_merge(path);
+                        }
+                    }
+
+                    if let Some(active) = &self.remote_active_path {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(format!("Speicherziel auf Server: {active}"))
+                                .italics()
+                                .color(egui::Color32::LIGHT_GREEN),
+                        );
+                    }
+                }
+            });
+
+        self.remote_window_open = open;
     }
 }
 
