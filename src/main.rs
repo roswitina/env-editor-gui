@@ -1,3 +1,4 @@
+
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
@@ -341,6 +342,13 @@ struct EnvEditorApp {
     remote_dir_entries: Vec<remote::RemoteDirEntry>,
     /// Status-/Fehlermeldungen speziell für den Remote-Dialog.
     remote_status: String,
+    /// Wenn gesetzt: Remote-Pfad einer Datei, die per "Alles ersetzen"
+    /// geladen werden SOLL, aber weil bereits Variablen geladen sind, erst
+    /// eine Bestätigung braucht (siehe `pending_template_overwrite`-Fenster
+    /// in `update`). Verhindert das versehentliche Überschreiben der
+    /// aktuellen Tabelle (z.B. .env statt example.env aus Versehen über
+    /// "Alles ersetzen" geladen).
+    pending_template_overwrite: Option<String>,
 }
 
 /// Eingabefelder des "SSH-Verbindung"-Dialogs. Getrennt von den gespeicherten
@@ -398,6 +406,7 @@ impl Default for EnvEditorApp {
             remote_active_path: None,
             remote_saved_connections: remote::load_connections(),
             remote_form: RemoteForm::default(),
+            pending_template_overwrite: None,
             remote_found_files: Vec::new(),
             remote_dir_entries: Vec::new(),
             remote_status: String::new(),
@@ -1251,15 +1260,15 @@ fn apply_theme(ctx: &egui::Context) {
 
     visuals.widgets.inactive.bg_fill = field_bg;
     visuals.widgets.inactive.weak_bg_fill = field_bg;
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, bright_text);
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, bright_text);
     visuals.widgets.hovered.bg_fill = field_bg_hover;
     visuals.widgets.hovered.weak_bg_fill = field_bg_hover;
-    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.2, egui::Color32::WHITE);
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.2_f32, egui::Color32::WHITE);
     visuals.widgets.active.bg_fill = field_bg_active;
     visuals.widgets.active.weak_bg_fill = field_bg_active;
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.2, egui::Color32::WHITE);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.2_f32, egui::Color32::WHITE);
     visuals.widgets.open.bg_fill = field_bg_active;
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, bright_text);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, bright_text);
 
     ctx.set_visuals(visuals);
 
@@ -1660,10 +1669,67 @@ impl EnvEditorApp {
 }
 
 impl EnvEditorApp {
+    /// Zeigt — falls durch einen Klick auf "Alles ersetzen (Vorlage)"
+    /// bei bereits geladenen Variablen ausgelöst — eine Rückfrage, bevor
+    /// die aktuelle Tabelle wirklich komplett verworfen wird. Verhindert
+    /// das versehentliche Ersetzen (statt Abgleichen) einer schon
+    /// geladenen Vorlage, z.B. wenn eine .env-Datei aus Versehen über
+    /// den falschen Button geladen wird und dabei neue, in ihr noch
+    /// unbekannte Variablen aus der Vorlage stillschweigend verschwinden.
+    fn render_template_overwrite_confirm(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.pending_template_overwrite.clone() else {
+            return;
+        };
+
+        let var_count = self
+            .items
+            .iter()
+            .filter(|i| matches!(i, EnvItem::Variable { .. }))
+            .count();
+
+        let mut still_open = true;
+        egui::Window::new("⚠ Vorlage wirklich ersetzen?")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut still_open)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Es sind bereits {var_count} Variablen geladen (z.B. aus einer zuvor \
+                     geladenen Vorlage oder einem Abgleich).\n\n\
+                     \"Alles ersetzen\" verwirft diese komplett und ersetzt sie durch den \
+                     Inhalt von:\n{path}\n\n\
+                     Falls diese Datei eine .env mit Werten ist und du nur deren Werte in \
+                     die bestehende Vorlage übernehmen willst (ohne Zeilen zu verlieren), \
+                     brich hier ab und nutze stattdessen \"➕ Werte übernehmen (Abgleich)\"."
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let confirm_btn = egui::Button::new("Trotzdem alles ersetzen")
+                        .fill(egui::Color32::from_rgb(120, 40, 40));
+                    if ui.add(confirm_btn).clicked() {
+                        self.remote_load_as_template(path.clone());
+                        self.pending_template_overwrite = None;
+                    }
+                    if ui.button("Abbrechen").clicked() {
+                        self.pending_template_overwrite = None;
+                    }
+                });
+            });
+
+        // Schließen über das X-Symbol des Fensters zählt als Abbrechen,
+        // damit kein Zustand "hängen" bleibt, aus dem man nicht mehr
+        // rauskommt.
+        if !still_open {
+            self.pending_template_overwrite = None;
+        }
+    }
+
     /// Zeigt den Dialog zum Verbinden mit einem Server per SSH/SFTP, das
     /// Verwalten gespeicherter Profile sowie die Auswahl von
     /// {example.env, .env.example, .env} im gewählten Remote-Verzeichnis.
     fn render_remote_window(&mut self, ctx: &egui::Context) {
+        self.render_template_overwrite_confirm(ctx);
+
         if !self.remote_window_open {
             return;
         }
@@ -1897,23 +1963,45 @@ impl EnvEditorApp {
                         for path in &self.remote_found_files {
                             ui.horizontal(|ui| {
                                 ui.label(path);
+                                // Bewusst warnend eingefärbt (rot/orange): dieser
+                                // Button LÖSCHT die aktuell geladene Tabelle
+                                // komplett, statt Werte nur zu übernehmen. Das war
+                                // in der Vergangenheit eine häufige Verwechslung
+                                // mit "Werte übernehmen" (z.B. .env aus Versehen
+                                // hierüber statt über den Abgleich geladen, wodurch
+                                // neue/unbekannte Variablen aus der Vorlage
+                                // stillschweigend verschwanden).
+                                let replace_btn = egui::Button::new("🗑 Alles ersetzen (Vorlage)")
+                                    .fill(egui::Color32::from_rgb(120, 40, 40));
                                 if ui
-                                    .button("Als Vorlage laden")
+                                    .add(replace_btn)
                                     .on_hover_text(
-                                        "Ersetzt die aktuelle Ansicht komplett durch diese Datei.",
+                                        "ACHTUNG: Ersetzt die aktuelle Ansicht komplett durch \
+                                         diese Datei. Bereits geladene/abgeglichene Werte gehen \
+                                         verloren. Für das Übernehmen von Werten aus einer .env \
+                                         in eine bereits geladene Vorlage stattdessen \
+                                         \"Werte übernehmen (Abgleich)\" verwenden.",
                                     )
                                     .clicked()
                                 {
-                                    load_template = Some(path.clone());
+                                    if self.items.is_empty() {
+                                        // Noch nichts geladen: Ersetzen ist hier
+                                        // harmlos, keine Rückfrage nötig.
+                                        load_template = Some(path.clone());
+                                    } else {
+                                        self.pending_template_overwrite = Some(path.clone());
+                                    }
                                 }
+                                let merge_btn = egui::Button::new("➕ Werte übernehmen (Abgleich)")
+                                    .fill(egui::Color32::from_rgb(40, 90, 50));
                                 if ui
-                                    .add_enabled(
-                                        !self.items.is_empty(),
-                                        egui::Button::new("Mit dieser abgleichen"),
-                                    )
+                                    .add_enabled(!self.items.is_empty(), merge_btn)
                                     .on_hover_text(
                                         "Übernimmt Werte aus dieser Datei in die bereits \
-                                         geladene Vorlage (wie \"2. Bestehende .env dazuladen\").",
+                                         geladene Vorlage, OHNE Zeilen zu löschen. Neue \
+                                         Variablen aus der Vorlage, die in dieser Datei noch \
+                                         nicht existieren, bleiben mit ihrem Vorlage-Default \
+                                         erhalten (wie \"2. Bestehende .env dazuladen\").",
                                     )
                                     .clicked()
                                 {
